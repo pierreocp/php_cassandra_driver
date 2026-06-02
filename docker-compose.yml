@@ -1,0 +1,26 @@
+services:
+  cassandra:
+    image: cassandra:5.0
+    environment:
+      CASSANDRA_CLUSTER_NAME: php-cassandra-driver
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    ports:
+      - "9042:9042"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' 127.0.0.1 9042"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  php:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    environment:
+      CASSANDRA_HOSTS: cassandra
+      CASSANDRA_PORT: "9042"
+    command: php examples/test.php

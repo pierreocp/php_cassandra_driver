@@ -74,6 +74,48 @@ Cassandra can take a few minutes to become healthy on first startup.
 
 ## PHP API
 
+### Official Cassandra Driver Compatible API ⭐ NEW
+
+The extension now supports the official Cassandra driver API pattern:
+
+```php
+// Official pattern: Cassandra::cluster()->withContactPoints()->build()->connect()
+$session = Cassandra::cluster()
+    ->withContactPoints('cassandra:9042')
+    ->build()
+    ->connect('my_keyspace');
+
+// SELECT queries
+$users = $session->query('SELECT * FROM users');
+
+// DML operations
+$session->execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)");
+
+// Prepared statements - prepare once, execute multiple times
+$prepared = $session->prepare('INSERT INTO users (id, name, age) VALUES (?, ?, ?)');
+$prepared->execute([1, 'Alice', 30]);
+$prepared->execute([2, 'Bob', 25]);
+$prepared->execute([3, 'Charlie', 35]);
+```
+
+**Available Classes:**
+- `Cassandra` - Entry point with `cluster()` method
+- `CassandraClusterBuilder` - Configure cluster with `withContactPoints()`, `withPort()`, `build()`
+- `CassandraCluster` - Cluster representation with `connect($keyspace)` method
+- `CassandraSession` - Active session with `query()`, `execute()`, `prepare()` methods
+- `CassandraPreparedStatement` - Prepared statement with `execute($params)` for optimized queries
+
+**Examples:**
+```bash
+# See full examples in examples/
+docker compose exec php php /app/examples/test_api.php
+docker compose exec php php /app/examples/test_official_pattern.php
+```
+
+### Legacy API (CassandraClient)
+
+The original low-level API is still available:
+
 ```php
 $client = new CassandraClient([
     'hosts' => ['127.0.0.1'], // string or string[]; defaults to 127.0.0.1

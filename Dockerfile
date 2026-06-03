@@ -4,6 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         clang \
+        cmake \
         curl \
         libclang-dev \
         make \
@@ -15,7 +16,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain stable
+    | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rustup update stable
 
 WORKDIR /app
 COPY Cargo.toml ./

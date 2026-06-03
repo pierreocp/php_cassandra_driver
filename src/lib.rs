@@ -1,18 +1,34 @@
 #![cfg_attr(windows, feature(abi_vectorcall))]
 
+//! Driver Cassandra/ScyllaDB pour PHP.
+//!
+//! Expose une API identique au driver officiel datastax/php-driver, telle
+//! qu'utilisée par `OCP\Lib\Storage\PdoCassandra` :
+//!
+//!     $cluster    = Cassandra::cluster()->withContactPoints($hosts)->build();
+//!     $session    = $cluster->connect($keyspace);
+//!     $stmt       = $session->prepare("SELECT ... WHERE id = :id");
+//!     $result     = $session->execute($stmt, ['arguments' => [$id]]);
+//!     foreach ($result as $row) { $row['data']; }
+//!
+//! Aucune modification du code PHP n'est nécessaire.
+
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ArrayKey, ZendHashTable, Zval};
+use ext_php_rs::types::{ZendHashTable, Zval};
 use once_cell::sync::Lazy;
 use scylla::client::session::Session as ScyllaSession;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::statement::prepared::PreparedStatement as ScyllaPrepared;
 use scylla::value::{CqlValue, Row};
 use tokio::runtime::{Builder, Runtime};
 
+/// Runtime Tokio partagé : le driver scylla est async, on bloque dessus
+/// pour exposer une API synchrone à PHP.
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()
         .enable_all()
@@ -22,7 +38,7 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });
 
 // ============================================================================
-// API compatible with official PHP Cassandra driver
+// Cassandra::cluster()
 // ============================================================================
 
 #[php_class]
@@ -31,7 +47,7 @@ pub struct Cassandra;
 
 #[php_impl]
 impl Cassandra {
-    /// Create a new cluster builder
+    /// `Cassandra::cluster()`
     pub fn cluster() -> ClusterBuilder {
         ClusterBuilder {
             contact_points: Vec::new(),
@@ -39,6 +55,10 @@ impl Cassandra {
         }
     }
 }
+
+// ============================================================================
+// Cluster builder (chaînage ->withContactPoints()->withPort()->build())
+// ============================================================================
 
 #[php_class]
 #[php(name = "CassandraClusterBuilder")]
@@ -49,20 +69,18 @@ pub struct ClusterBuilder {
 
 #[php_impl]
 impl ClusterBuilder {
-    /// Add contact points (hosts)
+    /// `->withContactPoints("h1,h2,...")` (camelCase appliqué par ext-php-rs).
     pub fn with_contact_points(&mut self, hosts: String) -> &mut Self {
-        // Parse comma-separated hosts
-        let parsed_hosts: Vec<String> = hosts
+        let parsed: Vec<String> = hosts
             .split(',')
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty())
             .collect();
-        
-        self.contact_points.extend(parsed_hosts);
+        self.contact_points.extend(parsed);
         self
     }
 
-    /// Set port for all contact points
+    /// `->withPort(9042)`
     pub fn with_port(&mut self, port: i64) -> &mut Self {
         if let Ok(p) = u16::try_from(port) {
             self.port = Some(p);
@@ -70,7 +88,7 @@ impl ClusterBuilder {
         self
     }
 
-    /// Build the cluster
+    /// `->build()`
     pub fn build(&self) -> Cluster {
         Cluster {
             contact_points: if self.contact_points.is_empty() {
@@ -83,6 +101,10 @@ impl ClusterBuilder {
     }
 }
 
+// ============================================================================
+// Cluster::connect()
+// ============================================================================
+
 #[php_class]
 #[php(name = "CassandraCluster")]
 pub struct Cluster {
@@ -92,21 +114,22 @@ pub struct Cluster {
 
 #[php_impl]
 impl Cluster {
-    /// Connect to the cluster with optional keyspace
+    /// `$cluster->connect($keyspace)`.
+    /// Le port natif CQL par défaut est 9042 (et non 9160, l'ancien port Thrift).
     pub fn connect(&self, keyspace: Option<String>) -> PhpResult<Session> {
         let mut builder = SessionBuilder::new();
 
         for host in &self.contact_points {
-            let known_node = match self.port {
+            let node = match self.port {
                 Some(_) if host.contains(':') => host.clone(),
                 Some(port) => format!("{host}:{port}"),
                 None => host.clone(),
             };
-            builder = builder.known_node(known_node);
+            builder = builder.known_node(node);
         }
 
-        if let Some(keyspace) = keyspace {
-            builder = builder.use_keyspace(keyspace, false);
+        if let Some(ks) = keyspace {
+            builder = builder.use_keyspace(ks, false);
         }
 
         let session = RUNTIME
@@ -115,418 +138,218 @@ impl Cluster {
 
         Ok(Session {
             session: Arc::new(session),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
+
+// ============================================================================
+// Session : prepare() / execute() / query()
+// ============================================================================
 
 #[php_class]
 #[php(name = "CassandraSession")]
 pub struct Session {
     session: Arc<ScyllaSession>,
+    /// Cache des statements préparés (clé = CQL) pour éviter un round-trip
+    /// PREPARE à chaque appel.
+    cache: Arc<Mutex<HashMap<String, Arc<ScyllaPrepared>>>>,
 }
 
 #[php_impl]
 impl Session {
-    /// Prepare a CQL statement
+    /// `$session->prepare($cql)`
     pub fn prepare(&self, cql: String) -> PhpResult<PreparedStatement> {
+        if let Some(prepared) = self.cache.lock().unwrap().get(&cql).cloned() {
+            return Ok(PreparedStatement {
+                session: Arc::clone(&self.session),
+                prepared,
+            });
+        }
+
         let prepared = RUNTIME
-            .block_on(async { self.session.prepare(cql).await })
+            .block_on(async { self.session.prepare(cql.clone()).await })
             .map_err(|err| to_php_exception(format!("Prepare failed: {err}")))?;
+        let prepared = Arc::new(prepared);
+
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(cql, Arc::clone(&prepared));
 
         Ok(PreparedStatement {
             session: Arc::clone(&self.session),
-            prepared: Arc::new(prepared),
+            prepared,
         })
     }
 
-    /// Execute a query or prepared statement
+    /// `$session->execute($stmt, ['arguments' => [...]])`
+    ///
+    /// `$stmt` peut être un PreparedStatement (cas normal) ou une chaîne CQL
+    /// brute (DDL : CREATE/DROP, ou BEGIN BATCH ... APPLY BATCH).
     pub fn execute(
         &self,
         statement: &Zval,
         options: Option<&ZendHashTable>,
     ) -> PhpResult<ZBox<ZendHashTable>> {
-        // Check if statement is a PreparedStatement object or a string
-        if let Some(obj) = statement.object() {
-            // Try to extract PreparedStatement from object
-            let class_name = obj.get_class_name().unwrap_or_default();
-            if class_name == "CassandraPreparedStatement" {
-                // It's a prepared statement - extract it
-                return self.execute_prepared_from_object(obj, options);
-            }
+        let args = parse_arguments(options)?;
+
+        // Statement préparé : on le ré-extrait de l'objet PHP et on l'exécute.
+        if let Some(prepared) = statement.extract::<&PreparedStatement>() {
+            return prepared.run(&args);
         }
 
-        // Otherwise treat as raw SQL string
+        // Sinon, CQL brut (DDL / batch).
         if let Some(cql) = statement.str() {
-            return self.execute_simple(cql.to_string(), options);
+            return run_query(&self.session, QueryKind::Simple(cql.to_string()), &args);
         }
 
         Err(to_php_exception(
-            "First argument must be a SQL string or PreparedStatement",
+            "execute() attend un CassandraPreparedStatement ou une chaîne CQL",
         ))
     }
 
-    /// Query that returns results
-    pub fn query(&self, cql: String, options: Option<&ZendHashTable>) -> PhpResult<ZBox<ZendHashTable>> {
-        self.execute_simple(cql, options)
-    }
-
-    fn execute_simple(&self, cql: String, options: Option<&ZendHashTable>) -> PhpResult<ZBox<ZendHashTable>> {
-        let params = parse_options(options)?;
-        
-        let query_result = RUNTIME
-            .block_on(async {
-                match &params {
-                    Params::Positional(values) => self.session.query_unpaged(cql, values.as_slice()).await,
-                    Params::Named(values) => self.session.query_unpaged(cql, values).await,
-                }
-            })
-            .map_err(|err| to_php_exception(format!("Query failed: {err}")))?;
-
-        // Check if result contains rows (DDL/DML statements don't return rows)
-        let rows_result = match query_result.into_rows_result() {
-            Ok(rows) => rows,
-            Err(_) => {
-                // Statement didn't return rows (likely DDL), return empty result
-                return Ok(ZendHashTable::new());
-            }
-        };
-
-        let column_names = rows_result
-            .column_specs()
-            .iter()
-            .map(|spec| spec.name().to_string())
-            .collect::<Vec<_>>();
-
-        let mut rows = Vec::with_capacity(rows_result.rows_num());
-        let mut row_iter = rows_result
-            .rows::<Row>()
-            .map_err(|err| to_php_exception(format!("Row metadata error: {err}")))?;
-
-        while let Some(row) = row_iter
-            .next()
-            .transpose()
-            .map_err(|err| to_php_exception(format!("Row deserialization failed: {err}")))?
-        {
-            rows.push(row.columns);
-        }
-
-        rows_to_php(QueryRows { column_names, rows })
-    }
-
-    fn execute_prepared_from_object(
+    /// `$session->query($cql, ['arguments' => [...]])`
+    pub fn query(
         &self,
-        _obj: &ext_php_rs::types::ZendObject,
+        cql: String,
         options: Option<&ZendHashTable>,
     ) -> PhpResult<ZBox<ZendHashTable>> {
-        // For now, return empty result
-        // This would need proper object extraction which is complex in ext-php-rs
-        let params = parse_options(options)?;
-        let _ = params; // Silence unused warning
-        
-        let result = ZendHashTable::new();
-        Ok(result)
+        let args = parse_arguments(options)?;
+        run_query(&self.session, QueryKind::Simple(cql), &args)
     }
 }
+
+// ============================================================================
+// PreparedStatement
+// ============================================================================
 
 #[php_class]
 #[php(name = "CassandraPreparedStatement")]
 pub struct PreparedStatement {
     session: Arc<ScyllaSession>,
-    prepared: Arc<scylla::statement::prepared::PreparedStatement>,
+    prepared: Arc<ScyllaPrepared>,
 }
 
 #[php_impl]
 impl PreparedStatement {
-    /// Execute the prepared statement with parameters
-    /// 
-    /// # Arguments
-    /// * `params` - Array of positional parameters (for now, named params not supported in prepared statements)
-    /// 
-    /// # Returns
-    /// Array of rows for SELECT queries, empty array for DML
+    /// Variante ISO : `$stmt->execute([...])` où le tableau est la liste
+    /// positionnelle d'arguments (sans la clé 'arguments'). Non utilisé par
+    /// PdoCassandra mais fourni pour compatibilité.
     pub fn execute(&self, params: Option<&ZendHashTable>) -> PhpResult<ZBox<ZendHashTable>> {
-        // Convert PHP array to Vec of CqlValue
-        let values = if let Some(params) = params {
-            let mut vec = Vec::with_capacity(params.len());
-            for (_, value) in params.iter() {
-                vec.push(php_scalar_to_cql(value)?);
+        let args = match params {
+            Some(arr) => {
+                let mut v = Vec::with_capacity(arr.len());
+                for (_, value) in arr.iter() {
+                    v.push(php_scalar_to_cql(value)?);
+                }
+                v
             }
-            vec
-        } else {
-            Vec::new()
+            None => Vec::new(),
         };
-        
-        let query_result = RUNTIME
-            .block_on(async {
-                self.session.execute_unpaged(&*self.prepared, values).await
-            })
-            .map_err(|err| to_php_exception(format!("Prepared statement execution failed: {err}")))?;
+        self.run(&args)
+    }
+}
 
-        // Check if result contains rows
-        let rows_result = match query_result.into_rows_result() {
-            Ok(rows) => rows,
-            Err(_) => {
-                // Statement didn't return rows (DML), return empty result
-                return Ok(ZendHashTable::new());
-            }
-        };
-
-        let column_names = rows_result
-            .column_specs()
-            .iter()
-            .map(|spec| spec.name().to_string())
-            .collect::<Vec<_>>();
-
-        let mut rows = Vec::with_capacity(rows_result.rows_num());
-        let mut row_iter = rows_result
-            .rows::<Row>()
-            .map_err(|err| to_php_exception(format!("Row metadata error: {err}")))?;
-
-        while let Some(row) = row_iter
-            .next()
-            .transpose()
-            .map_err(|err| to_php_exception(format!("Row deserialization failed: {err}")))?
-        {
-            rows.push(row.columns);
-        }
-
-        rows_to_php(QueryRows { column_names, rows })
+// Helper interne (non exposé à PHP).
+impl PreparedStatement {
+    fn run(&self, args: &[Option<CqlValue>]) -> PhpResult<ZBox<ZendHashTable>> {
+        run_query(
+            &self.session,
+            QueryKind::Prepared(Arc::clone(&self.prepared)),
+            args,
+        )
     }
 }
 
 // ============================================================================
-// Original simple API (kept for backward compatibility)
+// Exécution + conversion des résultats
 // ============================================================================
 
-#[php_class]
-#[php(name = "CassandraClient")]
-pub struct CassandraClient {
-    session: ScyllaSession,
+enum QueryKind {
+    Simple(String),
+    Prepared(Arc<ScyllaPrepared>),
 }
 
-#[php_impl]
-impl CassandraClient {
-    pub fn __construct(config: &ZendHashTable) -> PhpResult<Self> {
-        let config = ClientConfig::from_php(config)?;
-        let session = RUNTIME.block_on(async { config.connect().await })?;
-
-        Ok(Self { session })
-    }
-
-    pub fn query(
-        &self,
-        cql: String,
-        params: Option<&ZendHashTable>,
-    ) -> PhpResult<ZBox<ZendHashTable>> {
-        let params = Params::from_php(params)?;
-        let result = RUNTIME
-            .block_on(async { self.run_query(cql, params).await })
-            .map_err(to_php_exception)?;
-
-        rows_to_php(result)
-    }
-
-    pub fn execute(&self, cql: String, params: Option<&ZendHashTable>) -> PhpResult<()> {
-        let params = Params::from_php(params)?;
-        RUNTIME
-            .block_on(async { self.run_execute(cql, params).await })
-            .map_err(to_php_exception)?;
-
-        Ok(())
-    }
-}
-
-impl CassandraClient {
-    async fn run_query(&self, cql: String, params: Params) -> Result<QueryRows, String> {
-        let query_result = match params {
-            Params::Positional(values) => self.session.query_unpaged(cql, values.as_slice()).await,
-            Params::Named(values) => self.session.query_unpaged(cql, &values).await,
-        }
-        .map_err(|err| format!("Cassandra query failed: {err}"))?;
-
-        let rows_result = query_result
-            .into_rows_result()
-            .map_err(|err| format!("Cassandra statement did not return rows: {err}"))?;
-
-        let column_names = rows_result
-            .column_specs()
-            .iter()
-            .map(|spec| spec.name().to_string())
-            .collect::<Vec<_>>();
-
-        let mut rows = Vec::with_capacity(rows_result.rows_num());
-        let mut row_iter = rows_result
-            .rows::<Row>()
-            .map_err(|err| format!("Cassandra row metadata error: {err}"))?;
-
-        while let Some(row) = row_iter
-            .next()
-            .transpose()
-            .map_err(|err| format!("Cassandra row deserialization failed: {err}"))?
-        {
-            rows.push(row.columns);
-        }
-
-        Ok(QueryRows { column_names, rows })
-    }
-
-    async fn run_execute(&self, cql: String, params: Params) -> Result<(), String> {
-        match params {
-            Params::Positional(values) => self.session.query_unpaged(cql, values.as_slice()).await,
-            Params::Named(values) => self.session.query_unpaged(cql, &values).await,
-        }
-        .map_err(|err| format!("Cassandra execute failed: {err}"))?;
-
-        Ok(())
-    }
-}
-
-struct ClientConfig {
-    hosts: Vec<String>,
-    port: Option<u16>,
-    keyspace: Option<String>,
-}
-
-impl ClientConfig {
-    fn from_php(config: &ZendHashTable) -> PhpResult<Self> {
-        let hosts = match config.get("hosts") {
-            Some(value) if value.is_array() => value
-                .array()
-                .ok_or_else(|| to_php_exception("config.hosts must be an array"))?
-                .iter()
-                .map(|(_, host)| php_string(host, "config.hosts[]"))
-                .collect::<PhpResult<Vec<_>>>()?,
-            Some(value) => vec![php_string(value, "config.hosts")?],
-            None => vec!["127.0.0.1".to_string()],
-        };
-
-        if hosts.is_empty() {
-            return Err(to_php_exception(
-                "config.hosts must contain at least one host",
-            ));
-        }
-
-        let port = match config.get("port") {
-            Some(value) => Some(php_port(value)?),
-            None => None,
-        };
-
-        let keyspace = match config.get("keyspace") {
-            Some(value) if value.is_null() => None,
-            Some(value) => Some(php_string(value, "config.keyspace")?),
-            None => None,
-        };
-
-        Ok(Self {
-            hosts,
-            port,
-            keyspace,
+/// Exécute une requête (simple ou préparée) et convertit le résultat en
+/// tableau PHP : liste de lignes, chaque ligne étant un tableau associatif
+/// `colonne => valeur`. Les statements sans lignes (DDL/DML) renvoient `[]`.
+fn run_query(
+    session: &ScyllaSession,
+    kind: QueryKind,
+    args: &[Option<CqlValue>],
+) -> PhpResult<ZBox<ZendHashTable>> {
+    let result = RUNTIME
+        .block_on(async {
+            match kind {
+                QueryKind::Simple(cql) => session.query_unpaged(cql, args).await,
+                QueryKind::Prepared(prep) => session.execute_unpaged(&*prep, args).await,
+            }
         })
-    }
+        .map_err(|err| to_php_exception(format!("Query failed: {err}")))?;
 
-    async fn connect(self) -> Result<ScyllaSession, PhpException> {
-        let mut builder = SessionBuilder::new();
-
-        for host in &self.hosts {
-            let known_node = match self.port {
-                Some(_) if host.contains(':') => host.clone(),
-                Some(port) => format!("{host}:{port}"),
-                None => host.clone(),
-            };
-            builder = builder.known_node(known_node);
-        }
-
-        if let Some(keyspace) = self.keyspace {
-            builder = builder.use_keyspace(keyspace, false);
-        }
-
-        builder
-            .build()
-            .await
-            .map_err(|err| to_php_exception(format!("Cassandra connection failed: {err}")))
-    }
-}
-
-#[derive(Debug)]
-enum Params {
-    Positional(Vec<Option<CqlValue>>),
-    Named(HashMap<String, Option<CqlValue>>),
-}
-
-impl Params {
-    fn from_php(params: Option<&ZendHashTable>) -> PhpResult<Self> {
-        let Some(params) = params else {
-            return Ok(Self::Positional(Vec::new()));
-        };
-
-        let has_named_keys = params
-            .iter()
-            .any(|(key, _)| matches!(key, ArrayKey::Str(_) | ArrayKey::String(_)));
-
-        if has_named_keys {
-            let mut values = HashMap::with_capacity(params.len());
-            for (key, value) in params.iter() {
-                let key = match key {
-                    ArrayKey::Str(key) => key.to_string(),
-                    ArrayKey::String(key) => key.to_string(),
-                    ArrayKey::Long(_) => {
-                        return Err(to_php_exception("named params must use string keys only"));
-                    }
-                    _ => {
-                        return Err(to_php_exception("unsupported key type for named params"));
-                    }
-                };
-                values.insert(key, php_scalar_to_cql(value)?);
-            }
-            Ok(Self::Named(values))
-        } else {
-            let mut values = Vec::with_capacity(params.len());
-            for (_, value) in params.iter() {
-                values.push(php_scalar_to_cql(value)?);
-            }
-            Ok(Self::Positional(values))
-        }
-    }
-}
-
-fn parse_options(options: Option<&ZendHashTable>) -> PhpResult<Params> {
-    let Some(options) = options else {
-        return Ok(Params::Positional(Vec::new()));
+    // Les requêtes non-SELECT (INSERT/UPDATE/DELETE/DDL) ne renvoient pas de
+    // lignes : on retourne un tableau vide, comme le driver officiel.
+    let rows_result = match result.into_rows_result() {
+        Ok(rows) => rows,
+        Err(_) => return Ok(ZendHashTable::new()),
     };
 
-    // Look for 'arguments' key
-    if let Some(args_val) = options.get("arguments") {
-        if let Some(args_array) = args_val.array() {
-            return Params::from_php(Some(args_array));
-        }
-    }
+    let column_names: Vec<String> = rows_result
+        .column_specs()
+        .iter()
+        .map(|spec| spec.name().to_string())
+        .collect();
 
-    Ok(Params::Positional(Vec::new()))
-}
+    let mut table = ZendHashTable::new();
+    let mut iter = rows_result
+        .rows::<Row>()
+        .map_err(|err| to_php_exception(format!("Row metadata error: {err}")))?;
 
-struct QueryRows {
-    column_names: Vec<String>,
-    rows: Vec<Vec<Option<CqlValue>>>,
-}
-
-fn rows_to_php(query_rows: QueryRows) -> PhpResult<ZBox<ZendHashTable>> {
-    let mut php_rows = ZendHashTable::new();
-
-    for row in query_rows.rows {
+    while let Some(row) = iter
+        .next()
+        .transpose()
+        .map_err(|err| to_php_exception(format!("Row deserialization failed: {err}")))?
+    {
         let mut php_row = ZendHashTable::new();
-        for (index, value) in row.into_iter().enumerate() {
-            let column_name = query_rows
-                .column_names
+        for (index, value) in row.columns.into_iter().enumerate() {
+            let name = column_names
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| index.to_string());
-            php_row.insert(column_name, cql_to_zval(value)?)?;
+            php_row.insert(name, cql_to_zval(value)?)?;
         }
-        php_rows.push(php_row)?;
+        table.push(php_row)?;
     }
 
-    Ok(php_rows)
+    Ok(table)
 }
+
+/// Récupère `options['arguments']` sous forme de liste positionnelle.
+/// PdoCassandra passe toujours un tableau indexé (même pour les marqueurs
+/// nommés `:id`, `:md5`, ...), le binding positionnel est donc correct :
+/// scylla lie les valeurs dans l'ordre d'apparition des marqueurs.
+fn parse_arguments(options: Option<&ZendHashTable>) -> PhpResult<Vec<Option<CqlValue>>> {
+    let Some(options) = options else {
+        return Ok(Vec::new());
+    };
+    let Some(args_val) = options.get("arguments") else {
+        return Ok(Vec::new());
+    };
+    let Some(args) = args_val.array() else {
+        return Ok(Vec::new());
+    };
+
+    let mut values = Vec::with_capacity(args.len());
+    for (_, value) in args.iter() {
+        values.push(php_scalar_to_cql(value)?);
+    }
+    Ok(values)
+}
+
+// ============================================================================
+// Conversions PHP <-> CQL
+// ============================================================================
 
 fn php_scalar_to_cql(value: &Zval) -> PhpResult<Option<CqlValue>> {
     if value.is_null() {
@@ -576,23 +399,13 @@ fn cql_to_zval(value: Option<CqlValue>) -> PhpResult<Zval> {
     Ok(zval)
 }
 
-fn php_string(value: &Zval, name: &str) -> PhpResult<String> {
-    value
-        .str()
-        .map(ToString::to_string)
-        .ok_or_else(|| to_php_exception(format!("{name} must be a string")))
-}
-
-fn php_port(value: &Zval) -> PhpResult<u16> {
-    let port = value
-        .long()
-        .ok_or_else(|| to_php_exception("config.port must be an integer"))?;
-    u16::try_from(port).map_err(|_| to_php_exception("config.port must be between 0 and 65535"))
-}
-
 fn to_php_exception(message: impl Into<String>) -> PhpException {
     PhpException::default(message.into())
 }
+
+// ============================================================================
+// Enregistrement du module
+// ============================================================================
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
@@ -602,5 +415,4 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<Cluster>()
         .class::<Session>()
         .class::<PreparedStatement>()
-        .class::<CassandraClient>()
 }

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ext_php_rs::boxed::ZBox;
+use ext_php_rs::convert::FromZval;
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
@@ -195,7 +196,7 @@ impl Session {
         let args = parse_arguments(options)?;
 
         // Statement préparé : on le ré-extrait de l'objet PHP et on l'exécute.
-        if let Some(prepared) = statement.extract::<&PreparedStatement>() {
+        if let Some(prepared) = <&PreparedStatement as FromZval>::from_zval(statement) {
             return prepared.run(&args);
         }
 
@@ -289,11 +290,18 @@ fn run_query(
         .map_err(|err| to_php_exception(format!("Query failed: {err}")))?;
 
     // Les requêtes non-SELECT (INSERT/UPDATE/DELETE/DDL) ne renvoient pas de
-    // lignes : on retourne un tableau vide, comme le driver officiel.
+    // lignes. Scylla 1.6 peut retourner soit Err (résultat void), soit Ok avec
+    // 0 colonnes (résultat vide). Dans les deux cas on renvoie [true] pour que
+    // !empty($result) soit true côté PHP, comme l'objet Rows du driver officiel.
     let rows_result = match result.into_rows_result() {
         Ok(rows) => rows,
-        Err(_) => return Ok(ZendHashTable::new()),
+        Err(_) => return dml_ack(),
     };
+
+    // Résultat void renvoyé comme rows vides par scylla 1.6 (DML/DDL).
+    if rows_result.column_specs().len() == 0 {
+        return dml_ack();
+    }
 
     let column_names: Vec<String> = rows_result
         .column_specs()
@@ -323,6 +331,15 @@ fn run_query(
     }
 
     Ok(table)
+}
+
+/// Retourne `[true]` pour signaler un DML/DDL réussi.
+/// Un tableau non vide → `!empty($result)` = true côté PHP,
+/// comme l'objet Rows (toujours truthy) du driver officiel datastax.
+fn dml_ack() -> PhpResult<ZBox<ZendHashTable>> {
+    let mut ack = ZendHashTable::new();
+    ack.push(true)?;
+    Ok(ack)
 }
 
 /// Récupère `options['arguments']` sous forme de liste positionnelle.
